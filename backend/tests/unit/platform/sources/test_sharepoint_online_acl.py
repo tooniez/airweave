@@ -1,32 +1,43 @@
 """Unit tests for SharePoint Online ACL extraction.
 
 Covers ``extract_access_control`` and the rules around how Microsoft Graph
-sharing-link permissions map to ``AccessControl.is_public``.
+sharing-link permissions map to ``AccessControl``.
 
-Background — bug fix:
-    Organization-scoped sharing links (``link.scope == "organization"``,
-    "anyone in your org with the link") used to set ``is_public = True``,
-    which made the search broker bypass all viewer checks. That mis-modeled
-    SharePoint semantics: an org-scoped link requires possession of the
-    link URL to grant access. Only ``link.scope == "anonymous"`` is true
-    public access.
+Background — two related bug fixes:
+
+1. Organization-scoped sharing links (``link.scope == "organization"``,
+   "anyone in your org with the link") used to set ``is_public = True``,
+   which made the search broker bypass all viewer checks. Only
+   ``link.scope == "anonymous"`` is genuine public access.
+
+2. The previous code attempted to recover sharing-link audience by
+   blanket-attaching every site group (including SharingLinks system
+   groups for unrelated files) to every file in the site. That over-granted
+   massively. The fix is to translate each link permission into the
+   specific ``SharingLinks.<itemId>.<scopeRole>.<linkId>`` SP site group
+   for that one file, scoped by the file's SharePoint UniqueId.
 """
 
 import pytest
 
-from airweave.platform.sources.sharepoint_online.acl import extract_access_control
+from airweave.platform.sources.sharepoint_online.acl import (
+    extract_access_control,
+    link_permission_to_sp_group_viewer,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers — build minimal Graph permission objects
 # ---------------------------------------------------------------------------
 
 
-def _link_perm(scope: str, roles=None) -> dict:
+def _link_perm(
+    scope: str, type_: str = "edit", roles=None, link_id: str = "link-1"
+) -> dict:
     """Sharing-link permission with the given scope (no grantedTo principal)."""
     return {
-        "id": f"link-{scope}",
+        "id": link_id,
         "roles": roles if roles is not None else ["write"],
-        "link": {"scope": scope, "type": "edit"},
+        "link": {"scope": scope, "type": type_},
         "grantedToIdentitiesV2": [],
         "grantedToIdentities": [],
     }
@@ -68,8 +79,51 @@ async def test_organization_scoped_link_does_not_set_is_public():
     Regression: the previous behavior treated organization-scoped links as
     fully public, bypassing all viewer checks at search time.
     """
+    # Without sp_unique_id the link cannot be translated into a SharingLinks
+    # site group viewer either — both halves of the fix combine to give
+    # "no public access, no viewer either".
     ac = await extract_access_control([_link_perm("organization")])
     assert ac.is_public is False
+    assert ac.viewers == []
+
+
+@pytest.mark.asyncio
+async def test_organization_edit_link_with_sp_unique_id_yields_per_link_viewer():
+    """When the file's SP UniqueId is known, an org+edit link translates."""
+    perm = _link_perm("organization", type_="edit", link_id="LINK0001")
+    ac = await extract_access_control(
+        [perm], sp_unique_id="dd7691b0-3468-446f-81b0-72f3bdab7d1f"
+    )
+    assert ac.is_public is False
+    assert ac.viewers == [
+        "group:sp:sharinglinks.dd7691b0-3468-446f-81b0-72f3bdab7d1f.organizationedit.link0001"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_organization_view_link_translates_to_organizationview_suffix():
+    perm = _link_perm("organization", type_="view", link_id="LINK0002")
+    ac = await extract_access_control([perm], sp_unique_id="aaaa-bbbb")
+    assert ac.viewers == ["group:sp:sharinglinks.aaaa-bbbb.organizationview.link0002"]
+
+
+@pytest.mark.asyncio
+async def test_users_scope_link_translates_to_flexible_suffix():
+    """Empirically verified: both users+edit and users+view collapse to Flexible."""
+    perm_edit = _link_perm("users", type_="edit", link_id="LINKE")
+    perm_view = _link_perm("users", type_="view", link_id="LINKV")
+    ac_e = await extract_access_control([perm_edit], sp_unique_id="ITEM1")
+    ac_v = await extract_access_control([perm_view], sp_unique_id="ITEM1")
+    assert ac_e.viewers == ["group:sp:sharinglinks.item1.flexible.linke"]
+    assert ac_v.viewers == ["group:sp:sharinglinks.item1.flexible.linkv"]
+
+
+@pytest.mark.asyncio
+async def test_anonymous_link_does_not_get_translated_to_viewer():
+    """Anonymous → is_public, never a SharingLinks viewer."""
+    perm = _link_perm("anonymous", type_="view", link_id="LINKA")
+    ac = await extract_access_control([perm], sp_unique_id="ITEM1")
+    assert ac.is_public is True
     assert ac.viewers == []
 
 
@@ -105,25 +159,27 @@ async def test_unknown_link_scope_does_not_set_is_public():
 
 
 @pytest.mark.asyncio
-async def test_org_link_alongside_explicit_grants_extracts_only_grants():
-    """Org-link permission is skipped; explicit grants populate viewers.
+async def test_org_link_alongside_explicit_grants_extracts_grants_and_link_group():
+    """Org-link plus explicit grants → both end up in viewers.
 
-    Mirrors the Mistral bug-report payload: a file with one organization-
-    scoped sharing link plus the inherited site-group grants. The fix must
-    keep is_public false while still extracting Owners / Members / Visitors.
+    Mirrors the Mistral bug-report payload shape: a file with one
+    organization-scoped sharing link plus inherited site-group grants.
+    Post-fix, is_public is False, all explicit grants are present, and
+    the per-link SharingLinks site group is included exactly once.
     """
     perms = [
-        _link_perm("organization"),
+        _link_perm("organization", link_id="LINK0001"),
         _site_group_perm("Access Control Tests Owners", group_id="3", roles=["owner"]),
         _site_group_perm("Access Control Tests Members", group_id="5", roles=["write"]),
         _site_group_perm("Access Control Tests Visitors", group_id="4", roles=["read"]),
     ]
-    ac = await extract_access_control(perms)
+    ac = await extract_access_control(perms, sp_unique_id="ITEM1")
     assert ac.is_public is False
     assert set(ac.viewers) == {
         "group:sp:access_control_tests_owners",
         "group:sp:access_control_tests_members",
         "group:sp:access_control_tests_visitors",
+        "group:sp:sharinglinks.item1.organizationedit.link0001",
     }
 
 
@@ -191,3 +247,40 @@ async def test_duplicate_principal_only_added_once():
     ]
     ac = await extract_access_control(perms)
     assert ac.viewers == ["user:alice@example.com"]
+
+
+# ---------------------------------------------------------------------------
+# link_permission_to_sp_group_viewer — None-return paths
+# ---------------------------------------------------------------------------
+
+
+def test_link_translation_returns_none_without_sp_unique_id():
+    """No SP UniqueId means we can't construct the group name — return None."""
+    perm = _link_perm("organization", link_id="L1")
+    assert link_permission_to_sp_group_viewer(perm, None) is None
+
+
+def test_link_translation_returns_none_for_non_link_perm():
+    """A non-link permission is not a sharing link — return None."""
+    perm = {"id": "x", "roles": ["read"], "grantedToV2": {"user": {"email": "a@b.com"}}}
+    assert link_permission_to_sp_group_viewer(perm, "ITEM1") is None
+
+
+def test_link_translation_returns_none_for_anonymous():
+    perm = _link_perm("anonymous", link_id="L1")
+    assert link_permission_to_sp_group_viewer(perm, "ITEM1") is None
+
+
+def test_link_translation_returns_none_for_unknown_scope():
+    """Unknown / future scope: be conservative, don't fabricate a viewer."""
+    perm = {
+        "id": "L1",
+        "roles": ["read"],
+        "link": {"scope": "future-scope", "type": "edit"},
+    }
+    assert link_permission_to_sp_group_viewer(perm, "ITEM1") is None
+
+
+def test_link_translation_returns_none_when_link_id_missing():
+    perm = {"id": "", "roles": ["read"], "link": {"scope": "organization", "type": "edit"}}
+    assert link_permission_to_sp_group_viewer(perm, "ITEM1") is None
