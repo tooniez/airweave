@@ -303,6 +303,29 @@ class GraphClient:
                 return []
             raise
 
+    async def get_item_sp_unique_id(
+        self,
+        drive_id: str,
+        item_id: str,
+    ) -> Optional[str]:
+        """Fetch the SharePoint ``listItemUniqueId`` (lowercase GUID) for a drive item.
+
+        Used to translate sharing-link permissions into the underlying
+        ``SharingLinks.<itemId>.<scopeRole>.<linkId>`` SP site group viewer.
+        Only worth calling when the item has at least one ``link`` permission;
+        for items with only direct grants there's nothing to translate.
+        """
+        url = f"{GRAPH_BASE_URL}/drives/{drive_id}/items/{item_id}?$select=sharepointIds"
+        try:
+            data = await self.get(url)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                return None
+            raise
+        sp_ids = data.get("sharepointIds") or {}
+        luid = sp_ids.get("listItemUniqueId")
+        return luid.lower() if luid else None
+
     async def get_drive_root_permissions(
         self,
         drive_id: str,

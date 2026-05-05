@@ -598,48 +598,10 @@ class SharePointOnlineBase(BaseSource):
                 new_viewers.append(v)
         entity.access.viewers = new_viewers
 
-    async def _fetch_sp_group_viewers(self, site_url: str) -> List[str]:
-        """Fetch all SP site groups for a site and return their viewer strings.
-
-        Args:
-            site_url: Full site URL (e.g. https://tenant.sharepoint.com/sites/X).
-                Required — without it we can't hit the SP REST endpoint.
-        """
-        norm_site = self._normalize_site_url(site_url)
-        if not norm_site:
-            return []
-        sp_token_provider = self._make_sp_token_provider_for_site(norm_site)
-        if not sp_token_provider:
-            return []
-        try:
-            token = await sp_token_provider()
-            headers = {
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/json;odata=verbose",
-            }
-            resp = await self.http_client.get(
-                f"{norm_site}/_api/web/sitegroups",
-                headers=headers,
-                timeout=30.0,
-            )
-            resp.raise_for_status()
-            groups = resp.json().get("d", {}).get("results", [])
-
-            viewers = []
-            site_bucket = self._item_level_sp_groups.setdefault(norm_site, set())
-            for g in groups:
-                title = g.get("Title", "")
-                if title:
-                    tag = f"group:sp:{title.lower().replace(' ', '_')}"
-                    viewers.append(tag)
-                    site_bucket.add(tag[len("group:") :])
-            self.logger.info(f"Fetched {len(viewers)} SP site groups as viewers for {norm_site}")
-            return viewers
-        except SourceAuthError:
-            raise
-        except Exception as e:
-            self.logger.warning(f"SP group fetch failed for {norm_site}: {e}")
-            return []
+    @staticmethod
+    def _has_link_permission(permissions: List[Dict[str, Any]]) -> bool:
+        """Return True if any permission carries a sharing-link block."""
+        return any(p.get("link") for p in (permissions or []))
 
     async def _full_sync(  # noqa: C901
         self,
@@ -687,8 +649,6 @@ class SharePointOnlineBase(BaseSource):
                 self.logger.warning(f"Skipping site {site_id}: {e}")
                 continue
 
-            sp_group_viewers = await self._fetch_sp_group_viewers(site_url)
-
             for drive_data in all_drives:
                 drive_id = drive_data.get("id", "")
                 try:
@@ -730,20 +690,25 @@ class SharePointOnlineBase(BaseSource):
                                     item_data["id"],
                                 )
 
+                                # Sharing-link permissions need the file's SP UniqueId
+                                # to translate into the SharingLinks.* SP site group.
+                                # Skip the extra fetch when the file has no sharing links.
+                                sp_unique_id = None
+                                if self._has_link_permission(permissions):
+                                    sp_unique_id = await graph_client.get_item_sp_unique_id(
+                                        drive_id, item_data["id"]
+                                    )
+
                                 file_entity = await build_file_entity(
                                     item_data,
                                     drive_id,
                                     site_id,
                                     drive_breadcrumbs,
                                     permissions,
+                                    sp_unique_id=sp_unique_id,
                                 )
 
                                 await self._resolve_unresolved_viewers(file_entity, graph_client)
-                                if sp_group_viewers and file_entity.access:
-                                    existing = set(file_entity.access.viewers or [])
-                                    for spv in sp_group_viewers:
-                                        if spv not in existing:
-                                            file_entity.access.viewers.append(spv)
                                 self._track_entity_groups(file_entity, site_url)
 
                                 if files:
@@ -893,12 +858,18 @@ class SharePointOnlineBase(BaseSource):
                 if item_data.get("file"):
                     try:
                         permissions = await graph_client.get_item_permissions(drive_id, item_id)
+                        sp_unique_id = None
+                        if self._has_link_permission(permissions):
+                            sp_unique_id = await graph_client.get_item_sp_unique_id(
+                                drive_id, item_id
+                            )
                         file_entity = await build_file_entity(
                             item_data,
                             drive_id,
                             "",
                             [],
                             permissions,
+                            sp_unique_id=sp_unique_id,
                         )
                         await self._resolve_unresolved_viewers(file_entity, graph_client)
                         self._track_entity_groups(file_entity)
@@ -1036,8 +1007,18 @@ class SharePointOnlineBase(BaseSource):
                     item_data = await graph_client.get(url)
                     if item_data.get("file"):
                         permissions = await graph_client.get_item_permissions(drive_id, item_id)
+                        sp_unique_id = None
+                        if self._has_link_permission(permissions):
+                            sp_unique_id = await graph_client.get_item_sp_unique_id(
+                                drive_id, item_id
+                            )
                         file_entity = await build_file_entity(
-                            item_data, drive_id, "", [], permissions
+                            item_data,
+                            drive_id,
+                            "",
+                            [],
+                            permissions,
+                            sp_unique_id=sp_unique_id,
                         )
                         await self._resolve_unresolved_viewers(file_entity, graph_client)
                         self._track_entity_groups(file_entity)
@@ -1117,7 +1098,7 @@ class SharePointOnlineBase(BaseSource):
         ):
             yield entity
 
-    async def _process_file_items(
+    async def _process_file_items(  # noqa: C901
         self,
         graph_client: GraphClient,
         item_stream: AsyncGenerator[Dict[str, Any], None],
@@ -1136,8 +1117,18 @@ class SharePointOnlineBase(BaseSource):
                 continue
             try:
                 permissions = await graph_client.get_item_permissions(drive_id, item_data["id"])
+                sp_unique_id = None
+                if self._has_link_permission(permissions):
+                    sp_unique_id = await graph_client.get_item_sp_unique_id(
+                        drive_id, item_data["id"]
+                    )
                 file_entity = await build_file_entity(
-                    item_data, drive_id, site_id, breadcrumbs, permissions
+                    item_data,
+                    drive_id,
+                    site_id,
+                    breadcrumbs,
+                    permissions,
+                    sp_unique_id=sp_unique_id,
                 )
                 if resolve_viewers:
                     await self._resolve_unresolved_viewers(file_entity, graph_client)
