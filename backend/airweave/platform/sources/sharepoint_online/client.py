@@ -303,6 +303,30 @@ class GraphClient:
                 return []
             raise
 
+    async def list_internal_tenant_users(self) -> AsyncGenerator[Dict[str, str], None]:
+        """Yield internal tenant members (``userType eq 'Member'``).
+
+        Used to expand the SharePoint "Everyone except external users" claim
+        into per-user memberships of the synthetic claim group. The Graph
+        filter excludes guests (``userType eq 'Guest'``), preserving the
+        claim's "except external" semantics.
+
+        Yields:
+            Dicts with at least ``email`` (mail or userPrincipalName,
+            lowercased) and ``display_name``. Users without any addressable
+            identifier are skipped.
+        """
+        url = (
+            f"{GRAPH_BASE_URL}/users"
+            "?$filter=userType eq 'Member'"
+            "&$select=id,mail,userPrincipalName,displayName"
+        )
+        async for u in self.get_paginated(url):
+            email = (u.get("mail") or u.get("userPrincipalName") or "").strip().lower()
+            if not email:
+                continue
+            yield {"email": email, "display_name": u.get("displayName") or email}
+
     async def get_item_sp_unique_id(
         self,
         drive_id: str,

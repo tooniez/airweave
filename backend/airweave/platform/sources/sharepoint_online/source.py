@@ -75,6 +75,14 @@ from airweave.schemas.source_connection import AuthenticationMethod, OAuthType
 MAX_CONCURRENT_FILE_DOWNLOADS = 10
 ITEM_BATCH_SIZE = 50
 
+# Synthetic principal representing the SharePoint "Everyone except external users"
+# claim. SP exposes this claim as a member of site groups but our membership
+# table only handles real users / Entra groups / SP groups. We translate the
+# claim into a synthetic group, populate it with the tenant's internal members
+# at sync time, and let the broker's recursive expansion do the rest.
+EVERYONE_EXCEPT_EXTERNAL_PRINCIPAL = "claim:everyone_except_external"
+EVERYONE_EXCEPT_EXTERNAL_DISPLAY_NAME = "Everyone except external users (synthetic)"
+
 
 @dataclass
 class PendingFileDownload:
@@ -110,6 +118,10 @@ class SharePointOnlineBase(BaseSource):
     # Site-scoped SP group tracking: {site_url: {sp_group_name, ...}}
     # Keyed by normalized site URL so multi-site syncs can expand SP groups per site.
     _item_level_sp_groups: Dict[str, Set[str]]
+    # Set to True during membership extraction when an SP group contains the
+    # "Everyone except external users" claim, so we know to enumerate internal
+    # tenant users once at the end.
+    _needs_internal_user_enum: bool
 
     def _init_common(self, config: SharePointOnlineConfig) -> None:
         """Initialize fields shared by both OAuth and client-credentials sources."""
@@ -118,6 +130,7 @@ class SharePointOnlineBase(BaseSource):
         self._include_pages = config.include_pages
         self._item_level_entra_groups = set()
         self._item_level_sp_groups = {}
+        self._needs_internal_user_enum = False
 
     # -- Auth hooks (subclasses override) --
 
@@ -234,6 +247,14 @@ class SharePointOnlineBase(BaseSource):
         r"(?P<guid>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
         r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(_o)?$"
     )
+    # Match the "Everyone except external users" claim:
+    #   "c:0-.f|rolemanager|spo-grid-all-users/<tenantId>"
+    # PrincipalType=4 (SecurityGroup), but the claim provider is `rolemanager`
+    # rather than `federateddirectoryclaimprovider`. Represents all tenant
+    # users with userType=Member; excludes B2B guests by definition.
+    _EVERYONE_EXCEPT_EXTERNAL_LOGIN_RE = re.compile(
+        r"^c:0-\.f\|rolemanager\|spo-grid-all-users/[0-9a-fA-F-]+$"
+    )
 
     @classmethod
     def _email_from_membership_login(cls, login: str) -> Optional[str]:
@@ -255,16 +276,26 @@ class SharePointOnlineBase(BaseSource):
         """Parse one entry from /_api/web/sitegroups({id})/users into (member_id, member_type).
 
         Returns None for entries that should not become memberships:
-        - Role principals (PrincipalType=16, e.g. "Everyone except external users")
-        - Catch-all "All" principals (PrincipalType=15)
-        - DistList, SPGroup, unknown types (skipped; rare in practice)
+        - Catch-all "All" / "Everyone" principals (PrincipalType=15)
+        - DistList, SPGroup, RoleManager (other than the recognized claim below)
         - Unparseable entries (no email for users, no GUID for groups)
+
+        Recognized PrincipalType=4 shapes:
+        - Entra federated group: ``c:0o.c|federateddirectoryclaimprovider|<guid>[_o]``
+          → returns ``("entra:<guid>", "group")``.
+        - "Everyone except external users" claim:
+          ``c:0-.f|rolemanager|spo-grid-all-users/<tenantId>`` → returns the
+          synthetic ``(EVERYONE_EXCEPT_EXTERNAL_PRINCIPAL, "group")`` sentinel.
+          The caller (``_expand_sp_site_groups``) then enumerates internal
+          tenant users once per sync to populate the synthetic group.
+        - Any other PT=4 LoginName: returns None. The caller logs the raw
+          shape at info-level so unknown claim shapes show up in operator
+          logs and can be wired up explicitly later.
 
         PrincipalType reference:
             1  = User
             2  = DistList
-            4  = SecurityGroup (Entra group when LoginName uses
-                 federateddirectoryclaimprovider)
+            4  = SecurityGroup (Entra group OR rolemanager claim)
             8  = SPGroup
             15 = All
             16 = RoleManager
@@ -285,14 +316,31 @@ class SharePointOnlineBase(BaseSource):
 
         if ptype == 4:
             m = cls._ENTRA_GROUP_LOGIN_RE.match(login)
-            if not m:
-                return None
-            guid = m.group("guid").lower()
-            return (f"entra:{guid}", "group")
+            if m:
+                return (f"entra:{m.group('guid').lower()}", "group")
+            if cls._EVERYONE_EXCEPT_EXTERNAL_LOGIN_RE.match(login):
+                return (EVERYONE_EXCEPT_EXTERNAL_PRINCIPAL, "group")
+            return None
 
         # PrincipalType 2 (DistList), 8 (SPGroup), 15 (All), 16 (RoleManager),
         # and unknown types are intentionally skipped.
         return None
+
+    @classmethod
+    def _is_unrecognized_pt4_login(cls, user: Dict[str, Any]) -> bool:
+        """Return True for a PT=4 entry whose LoginName matches none of our patterns.
+
+        Used at the call site to emit a one-line diagnostic so that unknown
+        claim shapes (rare custom rolemanager roles, legacy Windows claims,
+        etc.) surface in operator logs without breaking sync.
+        """
+        if user.get("PrincipalType") != 4:
+            return False
+        login = user.get("LoginName", "") or ""
+        return not (
+            cls._ENTRA_GROUP_LOGIN_RE.match(login)
+            or cls._EVERYONE_EXCEPT_EXTERNAL_LOGIN_RE.match(login)
+        )
 
     # -- Browse Tree --
 
@@ -1248,6 +1296,12 @@ class SharePointOnlineBase(BaseSource):
                 for user in users:
                     parsed = self._parse_sp_group_member(user)
                     if parsed is None:
+                        if self._is_unrecognized_pt4_login(user):
+                            self.logger.info(
+                                "Unrecognized PrincipalType=4 SP group member; skipped. "
+                                f"LoginName={user.get('LoginName', '')!r} "
+                                f"Title={user.get('Title', '')!r}"
+                            )
                         continue
                     member_id, member_type = parsed
                     yield MembershipTuple(
@@ -1256,6 +1310,42 @@ class SharePointOnlineBase(BaseSource):
                         group_id=sp_name,
                         group_name=user.get("Title") or sp_name,
                     )
+                    if member_id == EVERYONE_EXCEPT_EXTERNAL_PRINCIPAL:
+                        self._needs_internal_user_enum = True
+
+    async def _expand_everyone_except_external(
+        self,
+    ) -> AsyncGenerator[MembershipTuple, None]:
+        """Populate the synthetic ``EVERYONE_EXCEPT_EXTERNAL_PRINCIPAL`` group.
+
+        Called once per sync, only when the SP group expansion observed at
+        least one occurrence of the claim. Enumerates internal tenant users
+        via Graph (``userType eq 'Member'`` filter excludes B2B guests) and
+        yields one user → claim membership per user. The broker's recursive
+        group expansion then chains user → claim → SP group at search time.
+        """
+        graph_client = self._create_graph_client()
+        count = 0
+        try:
+            async for u in graph_client.list_internal_tenant_users():
+                count += 1
+                yield MembershipTuple(
+                    member_id=u["email"],
+                    member_type="user",
+                    group_id=EVERYONE_EXCEPT_EXTERNAL_PRINCIPAL,
+                    group_name=EVERYONE_EXCEPT_EXTERNAL_DISPLAY_NAME,
+                )
+        except SourceAuthError:
+            raise
+        except Exception as e:
+            self.logger.warning(
+                f"Failed to enumerate internal tenant users for "
+                f"'{EVERYONE_EXCEPT_EXTERNAL_PRINCIPAL}': {e}"
+            )
+        self.logger.info(
+            f"Populated synthetic '{EVERYONE_EXCEPT_EXTERNAL_PRINCIPAL}' group "
+            f"with {count} internal tenant users"
+        )
 
     async def generate_access_control_memberships(
         self,
@@ -1263,6 +1353,7 @@ class SharePointOnlineBase(BaseSource):
         """Expand Entra ID groups and SP site groups into user memberships."""
         self.logger.info("Starting access control membership extraction")
         membership_count = 0
+        self._needs_internal_user_enum = False
         group_expander = self._create_group_expander()
 
         async for m in self._expand_entra_groups(group_expander):
@@ -1277,6 +1368,14 @@ class SharePointOnlineBase(BaseSource):
             raise
         except Exception as e:
             self.logger.warning(f"SP site group expansion failed: {e}")
+
+        # If any SP site group contained the "Everyone except external users"
+        # claim, populate the synthetic claim group with internal tenant users
+        # exactly once. Skipped entirely when no group used the claim.
+        if self._needs_internal_user_enum:
+            async for m in self._expand_everyone_except_external():
+                yield m
+                membership_count += 1
 
         group_expander.log_stats()
         self.logger.info(f"Access control extraction complete: {membership_count} memberships")
